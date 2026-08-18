@@ -27,13 +27,16 @@ MESSAGE_PIN_ID = None
 # ==========================================
 def envoyer_telegram(message):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        print("⚠️ Variables TELEGRAM manquantes dans Environment.")
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"}
     try:
-        requests.post(url, json=payload, timeout=10)
+        res = requests.post(url, json=payload, timeout=10).json()
+        if not res.get("ok"):
+            print(f"❌ Erreur API Telegram: {res}")
     except Exception as e:
-        print(f"Erreur Telegram: {e}")
+        print(f"❌ Erreur envoi Telegram: {e}")
 
 def mettre_a_jour_dashboard(tendances, en_session):
     global MESSAGE_PIN_ID
@@ -58,33 +61,38 @@ def mettre_a_jour_dashboard(tendances, en_session):
     texte += "\n*Filtres :* Trend H1 + SMA200 M15 + RSI + ATR Volatilité"
 
     if MESSAGE_PIN_ID:
-        url_edit = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/editMessageText"
-        payload = {"chat_id": TELEGRAM_CHAT_ID, "message_id": MESSAGE_PIN_ID, "text": texte, "parse_mode": "Markdown"}
-        res = requests.post(url_edit, json=payload, timeout=10).json()
-        if res.get("ok"):
-            return
+        try:
+            url_edit = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/editMessageText"
+            payload = {"chat_id": TELEGRAM_CHAT_ID, "message_id": MESSAGE_PIN_ID, "text": texte, "parse_mode": "Markdown"}
+            res = requests.post(url_edit, json=payload, timeout=10).json()
+            if res.get("ok"):
+                return
+        except Exception as e:
+            print(f"⚠️ Erreur édition Dashboard: {e}")
 
-    url_send = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": texte, "parse_mode": "Markdown"}
-    res_send = requests.post(url_send, json=payload, timeout=10).json()
+    try:
+        url_send = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        payload = {"chat_id": TELEGRAM_CHAT_ID, "text": texte, "parse_mode": "Markdown"}
+        res_send = requests.post(url_send, json=payload, timeout=10).json()
 
-    if res_send.get("ok"):
-        MESSAGE_PIN_ID = res_send["result"]["message_id"]
-        url_pin = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/pinChatMessage"
-        requests.post(url_pin, json={"chat_id": TELEGRAM_CHAT_ID, "message_id": MESSAGE_PIN_ID, "disable_notification": True})
+        if res_send.get("ok"):
+            MESSAGE_PIN_ID = res_send["result"]["message_id"]
+            url_pin = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/pinChatMessage"
+            requests.post(url_pin, json={"chat_id": TELEGRAM_CHAT_ID, "message_id": MESSAGE_PIN_ID, "disable_notification": True})
+            print("📌 Nouveau Dashboard envoyé et épinglé.")
+        else:
+            print(f"❌ Échec envoi Dashboard: {res_send}")
+    except Exception as e:
+        print(f"❌ Erreur création Dashboard: {e}")
 
 # ==========================================
 # STRATÉGIE DAY TRADING MULTI-TP
 # ==========================================
 def est_jour_et_session_valide():
     maintenant = datetime.utcnow()
-    jour_semaine = maintenant.weekday()  # 0 = Lundi, 4 = Vendredi
-    heure_utc = maintenant.hour
-
-    if jour_semaine > 4:
+    if maintenant.weekday() > 4:
         return False
-
-    return 7 <= heure_utc < 17
+    return 7 <= maintenant.hour < 17
 
 def obtenir_tendance_h1(ticker):
     try:
@@ -103,25 +111,20 @@ def obtenir_tendance_h1(ticker):
             return "BAISSIER"
         return "NEUTRE"
     except Exception as e:
-        print(f"Erreur Tendance H1 sur {ticker}: {e}")
+        print(f"⚠️ Erreur Tendance H1 {ticker}: {e}")
         return "NEUTRE"
 
 def analyser_signal_daytrading(df, tendance_h1):
     if len(df) < 200:
         return None, None
 
-    # --- INDICATEURS SYSTEME ---
-    # 1. SMA 200
     df['sma200'] = df['Close'].rolling(window=200).mean()
-
-    # 2. RSI 14
     delta = df['Close'].diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
     rs = gain / loss
     df['rsi'] = 100 - (100 / (1 + rs))
 
-    # 3. ATR 14
     df['tr'] = pd.concat([
         df['High'] - df['Low'],
         (df['High'] - df['Close'].shift(1)).abs(),
@@ -135,7 +138,6 @@ def analyser_signal_daytrading(df, tendance_h1):
     sma200_val = c3['sma200']
 
     filtre_volatilite = (c3['High'] - c3['Low']) >= (0.6 * atr_val)
-
     swing_high = df['High'].iloc[-11:-1].max()
     swing_low = df['Low'].iloc[-11:-1].min()
 
@@ -151,11 +153,7 @@ def analyser_signal_daytrading(df, tendance_h1):
         distance_risk = pe - sl
         if distance_risk <= 0:
             return None, None
-        
-        tp1 = pe + (0.5 * distance_risk)
-        tp2 = pe + (1.0 * distance_risk)
-        tp3 = pe + (1.8 * distance_risk)
-        return "BUY", (pe, sl, tp1, tp2, tp3)
+        return "BUY", (pe, sl, pe + 0.5 * distance_risk, pe + 1.0 * distance_risk, pe + 1.8 * distance_risk)
 
     elif cond_sell:
         pe = float(c3['Close'])
@@ -163,16 +161,13 @@ def analyser_signal_daytrading(df, tendance_h1):
         distance_risk = sl - pe
         if distance_risk <= 0:
             return None, None
-
-        tp1 = pe - (0.5 * distance_risk)
-        tp2 = pe - (1.0 * distance_risk)
-        tp3 = pe - (1.8 * distance_risk)
-        return "SELL", (pe, sl, tp1, tp2, tp3)
+        return "SELL", (pe, sl, pe - 0.5 * distance_risk, pe - 1.0 * distance_risk, pe - 1.8 * distance_risk)
 
     return None, None
 
 def analyser_marche():
     global dernier_signal
+    print(f"🔍 [{datetime.utcnow().strftime('%H:%M:%S UTC')}] Début de l'analyse des marchés...")
     session_valide = est_jour_et_session_valide()
     tendances = {}
 
@@ -212,28 +207,22 @@ def analyser_marche():
                 dernier_signal[nom_actif] = signal
 
         except Exception as e:
-            print(f"Erreur d'analyse sur {nom_actif} : {e}")
+            print(f"❌ Erreur sur {nom_actif}: {e}")
 
     mettre_a_jour_dashboard(tendances, session_valide)
+    print("✅ Scan terminé.")
 
 # ==========================================
-# SERVEUR FLASK & BOUCLE
+# SERVEUR FLASK
 # ==========================================
 app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "Bot Day Trading Forex Opérationnel."
-
-def boucle_bot():
-    while True:
-        analyser_marche()
-        time.sleep(900)  # Scan toutes les 15 minutes
+    # Déclenche un scan à chaque fois que le serveur est sollicité par un pinger ou un navigateur
+    Thread(target=analyser_marche).start()
+    return "Bot Day Trading Forex Opérationnel. Scan en cours..."
 
 if __name__ == '__main__':
-    t = Thread(target=boucle_bot)
-    t.daemon = True
-    t.start()
-    
     port = int(os.environ.get("PORT", 10000))
     app.run(host='0.0.0.0', port=port)
