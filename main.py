@@ -45,8 +45,8 @@ def mettre_a_jour_dashboard(tendances, en_session):
 
     texte = (
         f"📊 *DASHBOARD DAY TRADING FOREX*\n"
-        f"────────────────────────\n"
-        f"⏱️ *Dernier scan :* {heure_actuelle}\n"
+        f"-----------------------------------\n"
+        f"⏰ *Dernier scan :* {heure_actuelle}\n"
         f"🎯 *Session :* {statut_session}\n\n"
         f"📈 *Tendances H1 Actuelles :*\n"
     )
@@ -55,7 +55,7 @@ def mettre_a_jour_dashboard(tendances, en_session):
         emoji = "🟢 HAUSSIER" if tend == "HAUSSIER" else ("🔴 BAISSIER" if tend == "BAISSIER" else "⚪ NEUTRE")
         texte += f"• *{actif} :* {emoji}\n"
 
-    texte += f"\n⚙️ *Filtres :* Trend H1 + Breakout Retest M15 + ATR Volatilité"
+    texte += "\n*Filtres :* Trend H1 + SMA200 M15 + RSI + ATR Volatilité"
 
     if MESSAGE_PIN_ID:
         url_edit = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/editMessageText"
@@ -78,13 +78,13 @@ def mettre_a_jour_dashboard(tendances, en_session):
 # ==========================================
 def est_jour_et_session_valide():
     maintenant = datetime.utcnow()
-    jour_semaine = maintenant.weekday() # 0 = Lundi, 4 = Vendredi
+    jour_semaine = maintenant.weekday()  # 0 = Lundi, 4 = Vendredi
     heure_utc = maintenant.hour
 
     if jour_semaine > 4:
         return False
 
-    return (7 <= heure_utc < 17)
+    return 7 <= heure_utc < 17
 
 def obtenir_tendance_h1(ticker):
     try:
@@ -101,54 +101,72 @@ def obtenir_tendance_h1(ticker):
             return "HAUSSIER"
         elif prix < ema20 and ema20 < ema50:
             return "BAISSIER"
+        return "NEUTRE"
     except Exception as e:
         print(f"Erreur Tendance H1 sur {ticker}: {e}")
-    return "NEUTRE"
+        return "NEUTRE"
 
 def analyser_signal_daytrading(df, tendance_h1):
-    if len(df) < 15:
+    if len(df) < 200:
         return None, None
 
+    # --- INDICATEURS SYSTEME ---
+    # 1. SMA 200
+    df['sma200'] = df['Close'].rolling(window=200).mean()
+
+    # 2. RSI 14
+    delta = df['Close'].diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+    rs = gain / loss
+    df['rsi'] = 100 - (100 / (1 + rs))
+
+    # 3. ATR 14
     df['tr'] = pd.concat([
         df['High'] - df['Low'],
         (df['High'] - df['Close'].shift(1)).abs(),
         (df['Low'] - df['Close'].shift(1)).abs()
     ], axis=1).max(axis=1)
-    atr = df['tr'].rolling(window=14).mean().iloc[-1]
+    df['atr'] = df['tr'].rolling(window=14).mean()
 
     c3 = df.iloc[-1]
-    swing_low = df['Low'].iloc[-10:-2].min()
-    swing_high = df['High'].iloc[-10:-2].max()
+    rsi_val = c3['rsi']
+    atr_val = c3['atr']
+    sma200_val = c3['sma200']
 
-    if (c3['High'] - c3['Low']) < (0.5 * atr):
-        return None, None
+    filtre_volatilite = (c3['High'] - c3['Low']) >= (0.6 * atr_val)
 
-    if tendance_h1 == "HAUSSIER" and c3['Close'] > swing_high:
+    swing_high = df['High'].iloc[-11:-1].max()
+    swing_low = df['Low'].iloc[-11:-1].min()
+
+    rsi_buy = (rsi_val > 50) and (rsi_val < 70)
+    cond_buy = (tendance_h1 == "HAUSSIER") and (c3['Close'] > sma200_val) and rsi_buy and (c3['Close'] > swing_high) and filtre_volatilite
+
+    rsi_sell = (rsi_val < 50) and (rsi_val > 30)
+    cond_sell = (tendance_h1 == "BAISSIER") and (c3['Close'] < sma200_val) and rsi_sell and (c3['Close'] < swing_low) and filtre_volatilite
+
+    if cond_buy:
         pe = float(c3['Close'])
         sl = float(min(c3['Low'], df['Low'].iloc[-2]))
-        
         distance_risk = pe - sl
         if distance_risk <= 0:
             return None, None
-
-        tp1 = pe + (0.8 * distance_risk)
-        tp2 = pe + (1.5 * distance_risk)
-        tp3 = pe + (2.5 * distance_risk)
-
+        
+        tp1 = pe + (0.5 * distance_risk)
+        tp2 = pe + (1.0 * distance_risk)
+        tp3 = pe + (1.8 * distance_risk)
         return "BUY", (pe, sl, tp1, tp2, tp3)
 
-    elif tendance_h1 == "BAISSIER" and c3['Close'] < swing_low:
+    elif cond_sell:
         pe = float(c3['Close'])
         sl = float(max(c3['High'], df['High'].iloc[-2]))
-        
         distance_risk = sl - pe
         if distance_risk <= 0:
             return None, None
 
-        tp1 = pe - (0.8 * distance_risk)
-        tp2 = pe - (1.5 * distance_risk)
-        tp3 = pe - (2.5 * distance_risk)
-
+        tp1 = pe - (0.5 * distance_risk)
+        tp2 = pe - (1.0 * distance_risk)
+        tp3 = pe - (1.8 * distance_risk)
         return "SELL", (pe, sl, tp1, tp2, tp3)
 
     return None, None
@@ -167,7 +185,7 @@ def analyser_marche():
                 continue
 
             t = yf.Ticker(ticker)
-            data = t.history(period="3d", interval="15m")
+            data = t.history(period="7d", interval="15m")
             if data.empty:
                 continue
 
@@ -179,16 +197,16 @@ def analyser_marche():
                 dec = 3 if "JPY" in nom_actif else 5
 
                 msg = (
-                    f"🚀 *SIGNAL DAY TRADING HIGH PROBABILITY* 🚀\n\n"
-                    f"• *Actif :* {nom_actif}\n"
-                    f"• *Sens :* {sens_txt}\n"
-                    f"• *Tendance H1 :* {tendance_h1}\n\n"
-                    f"📍 *PRIX D'ENTRÉE :* `{pe:.{dec}f}`\n\n"
+                    f"🔥 *SIGNAL DAY TRADING HIGH PROBABILITY*\n\n"
+                    f"📍 *Actif :* {nom_actif}\n"
+                    f"🎯 *Sens :* {sens_txt}\n"
+                    f"📈 *Tendance H1 :* {tendance_h1}\n\n"
+                    f"💵 *PRIX D'ENTRÉE :* `{pe:.{dec}f}`\n"
                     f"🎯 *TAKE-PROFIT 1 :* `{tp1:.{dec}f}`\n"
                     f"🎯 *TAKE-PROFIT 2 :* `{tp2:.{dec}f}`\n"
-                    f"🎯 *TAKE-PROFIT 3 :* `{tp3:.{dec}f}`\n\n"
-                    f"🛑 *STOP-LOSS :* `{sl:.{dec}f}`\n\n"
-                    f"💡 *Gestion du risque :* Lorsque la première position atteint le TP1, déplacez le SL au point d'entrée (breakeven) pour les positions restantes."
+                    f"🎯 *TAKE-PROFIT 3 :* `{tp3:.{dec}f}`\n"
+                    f"🛡️ *STOP-LOSS :* `{sl:.{dec}f}`\n\n"
+                    f"💡 *Gestion du risque :* Dès que TP1 est atteint, déplacez le SL au prix d'entrée."
                 )
                 envoyer_telegram(msg)
                 dernier_signal[nom_actif] = signal
@@ -210,7 +228,7 @@ def home():
 def boucle_bot():
     while True:
         analyser_marche()
-        time.sleep(900)
+        time.sleep(900)  # Scan toutes les 15 minutes
 
 if __name__ == '__main__':
     t = Thread(target=boucle_bot)
