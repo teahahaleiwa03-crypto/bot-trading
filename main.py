@@ -1,7 +1,6 @@
 import os
 import time
 import requests
-import yfinance as yf
 import pandas as pd
 from datetime import datetime
 from flask import Flask
@@ -21,6 +20,31 @@ ACTIFS = {
 
 dernier_signal = {actif: None for actif in ACTIFS.keys()}
 MESSAGE_PIN_ID = None
+
+# ==========================================
+# RÉCUPÉRATION DONNÉES SÉCURISÉE (NO RATE-LIMIT)
+# ==========================================
+def telecharger_donnees_yahoo(ticker, range_period, interval):
+    try:
+        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?range={range_period}&interval={interval}"
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
+        res = requests.get(url, headers=headers, timeout=10).json()
+        
+        result = res['chart']['result'][0]
+        timestamps = result['timestamp']
+        quote = result['indicators']['quote'][0]
+        
+        df = pd.DataFrame({
+            'Open': quote['open'],
+            'High': quote['high'],
+            'Low': quote['low'],
+            'Close': quote['close']
+        }, index=pd.to_datetime(timestamps, unit='s')).dropna()
+        
+        return df
+    except Exception as e:
+        print(f"⚠️ Erreur téléchargement {ticker} ({interval}): {e}")
+        return pd.DataFrame()
 
 # ==========================================
 # FONCTIONS TELEGRAM & DASHBOARD
@@ -60,6 +84,7 @@ def mettre_a_jour_dashboard(tendances, en_session):
 
     texte += "\n*Filtres :* Trend H1 + SMA200 M15 + RSI + ATR Volatilité"
 
+    # Tentative d'édition
     if MESSAGE_PIN_ID:
         try:
             url_edit = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/editMessageText"
@@ -70,6 +95,7 @@ def mettre_a_jour_dashboard(tendances, en_session):
         except Exception as e:
             print(f"⚠️ Erreur édition Dashboard: {e}")
 
+    # Création d'un nouveau message si pas de message existant
     try:
         url_send = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
         payload = {"chat_id": TELEGRAM_CHAT_ID, "text": texte, "parse_mode": "Markdown"}
@@ -79,9 +105,9 @@ def mettre_a_jour_dashboard(tendances, en_session):
             MESSAGE_PIN_ID = res_send["result"]["message_id"]
             url_pin = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/pinChatMessage"
             requests.post(url_pin, json={"chat_id": TELEGRAM_CHAT_ID, "message_id": MESSAGE_PIN_ID, "disable_notification": True})
-            print("📌 Nouveau Dashboard envoyé et épinglé.")
+            print("📌 Dashboard envoyé et épinglé avec succès sur Telegram !")
         else:
-            print(f"❌ Échec envoi Dashboard: {res_send}")
+            print(f"❌ Échec envoi Dashboard Telegram: {res_send}")
     except Exception as e:
         print(f"❌ Erreur création Dashboard: {e}")
 
@@ -95,24 +121,19 @@ def est_jour_et_session_valide():
     return 7 <= maintenant.hour < 17
 
 def obtenir_tendance_h1(ticker):
-    try:
-        t = yf.Ticker(ticker)
-        data_1h = t.history(period="5d", interval="1h")
-        if data_1h.empty or len(data_1h) < 30:
-            return "NEUTRE"
-
-        ema20 = data_1h['Close'].ewm(span=20, adjust=False).mean().iloc[-1]
-        ema50 = data_1h['Close'].ewm(span=50, adjust=False).mean().iloc[-1]
-        prix = data_1h['Close'].iloc[-1]
-
-        if prix > ema20 and ema20 > ema50:
-            return "HAUSSIER"
-        elif prix < ema20 and ema20 < ema50:
-            return "BAISSIER"
+    df = telecharger_donnees_yahoo(ticker, "5d", "1h")
+    if df.empty or len(df) < 30:
         return "NEUTRE"
-    except Exception as e:
-        print(f"⚠️ Erreur Tendance H1 {ticker}: {e}")
-        return "NEUTRE"
+
+    ema20 = df['Close'].ewm(span=20, adjust=False).mean().iloc[-1]
+    ema50 = df['Close'].ewm(span=50, adjust=False).mean().iloc[-1]
+    prix = df['Close'].iloc[-1]
+
+    if prix > ema20 and ema20 > ema50:
+        return "HAUSSIER"
+    elif prix < ema20 and ema20 < ema50:
+        return "BAISSIER"
+    return "NEUTRE"
 
 def analyser_signal_daytrading(df, tendance_h1):
     if len(df) < 200:
@@ -179,8 +200,7 @@ def analyser_marche():
             if not session_valide or tendance_h1 == "NEUTRE":
                 continue
 
-            t = yf.Ticker(ticker)
-            data = t.history(period="7d", interval="15m")
+            data = telecharger_donnees_yahoo(ticker, "7d", "15m")
             if data.empty:
                 continue
 
@@ -210,16 +230,15 @@ def analyser_marche():
             print(f"❌ Erreur sur {nom_actif}: {e}")
 
     mettre_a_jour_dashboard(tendances, session_valide)
-    print("✅ Scan terminé.")
+    print("✅ Scan terminé avec succès.")
 
 # ==========================================
-# SERVEUR FLASK
+# SERVEUR FLASK & DÉCLENCHEMENT
 # ==========================================
 app = Flask(__name__)
 
 @app.route('/')
 def home():
-    # Déclenche un scan à chaque fois que le serveur est sollicité par un pinger ou un navigateur
     Thread(target=analyser_marche).start()
     return "Bot Day Trading Forex Opérationnel. Scan en cours..."
 
