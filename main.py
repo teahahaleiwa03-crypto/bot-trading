@@ -187,21 +187,14 @@ def analyser_marche():
 
                 msg = (
                     f"🚀 *SIGNAL DAY TRADING HIGH PROBABILITY* 🚀\n\n"
-                    
                     f"• *Actif :* {nom_actif}\n"
-                    
                     f"• *Sens :* {sens_txt}\n"
-                    
                     f"• *Tendance H1 :* {tendance_h1}\n\n"
-                    
                     f"📍 *PRIX D'ENTRÉE :* `{pe:.{dec}f}`\n\n"
-                    
                     f"🎯 *TAKE-PROFIT 1 :* `{tp1:.{dec}f}`\n"
                     f"🎯 *TAKE-PROFIT 2 :* `{tp2:.{dec}f}`\n"
                     f"🎯 *TAKE-PROFIT 3 :* `{tp3:.{dec}f}`\n\n"
-                    
                     f"🛑 *STOP-LOSS :* `{sl:.{dec}f}`\n\n"
-                    
                     f"💡 *Gestion du risque :* Lorsque la première position atteint le TP1, déplacez le SL au point d'entrée (breakeven) pour les positions restantes."
                 )
                 envoyer_telegram(msg)
