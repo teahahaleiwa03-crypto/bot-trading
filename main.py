@@ -8,7 +8,7 @@ import requests
 from flask import Flask
 
 # ==========================================
-# MINI SERVEUR FLASK POUR RENDER WEB SERVICE
+# SERVEUR WEB FLASK
 # ==========================================
 app = Flask(__name__)
 
@@ -21,7 +21,7 @@ def run_flask():
     app.run(host='0.0.0.0', port=port)
 
 # ==========================================
-# CONFIGURATION ET VARIABLES D'ENVIRONNEMENT
+# CONFIGURATION
 # ==========================================
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
@@ -35,17 +35,13 @@ PAIRES = {
 dashboard_msg_id = None
 
 # ==========================================
-# FONCTIONS TELEGRAM API
+# TELEGRAM API
 # ==========================================
 def send_telegram_message(text):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         return None
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": text,
-        "parse_mode": "HTML"
-    }
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML"}
     try:
         res = requests.post(url, json=payload, timeout=10)
         data = res.json()
@@ -59,22 +55,16 @@ def update_telegram_message(message_id, text):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID or not message_id:
         return False
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/editMessageText"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "message_id": message_id,
-        "text": text,
-        "parse_mode": "HTML"
-    }
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "message_id": message_id, "text": text, "parse_mode": "HTML"}
     try:
         res = requests.post(url, json=payload, timeout=10)
-        data = res.json()
-        return data.get("ok", False)
+        return res.json().get("ok", False)
     except Exception as e:
         print(f"Erreur Edit Telegram : {e}")
         return False
 
 # ==========================================
-# GESTION DES SESSIONS (24H/24 LUN-VEN)
+# GESTION DES SESSIONS
 # ==========================================
 def check_session_active():
     now_utc = datetime.now(pytz.utc)
@@ -85,18 +75,14 @@ def check_session_active():
         return False, "🔴 INACTIVE (Week-end)"
 
 # ==========================================
-# CALCUL DES INDICATEURS ET ANALYSE
+# TELECHARGEMENT DONNEES SANS BLOCAGE
 # ==========================================
 def get_market_data(ticker):
-    """Récupère les données avec gestion du rate limit."""
     try:
-        # Session personnalisée pour éviter le blocage Yahoo Finance
-        session = requests.Session()
-        session.headers['User-Agent'] = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'
-        
-        data_h1 = yf.download(ticker, period="10d", interval="1h", progress=False, session=session)
-        time.sleep(2)  # Pause pour ne pas surcharger l'API
-        data_m15 = yf.download(ticker, period="5d", interval="15m", progress=False, session=session)
+        t = yf.Ticker(ticker)
+        data_h1 = t.history(period="10d", interval="1h")
+        time.sleep(1.5)
+        data_m15 = t.history(period="5d", interval="15m")
         
         if data_h1.empty or data_m15.empty:
             return None, None
@@ -106,6 +92,9 @@ def get_market_data(ticker):
         print(f"Erreur téléchargement {ticker} : {e}")
         return None, None
 
+# ==========================================
+# STRATEGIE & ANALYSE
+# ==========================================
 def analyze_h1_trend(df_h1):
     if df_h1 is None or len(df_h1) < 50:
         return "INDISPONIBLE"
@@ -155,6 +144,9 @@ def check_m15_signal(df_m15, trend_h1):
 
     return None
 
+# ==========================================
+# BOUCLE PRINCIPALE
+# ==========================================
 def bot_loop():
     global dashboard_msg_id
     
@@ -168,7 +160,7 @@ def bot_loop():
 
             for nom_paire, ticker in PAIRES.items():
                 df_h1, df_m15 = get_market_data(ticker)
-                time.sleep(3)  # Pause renforcée
+                time.sleep(2)
                 trend = analyze_h1_trend(df_h1)
                 trends[nom_paire] = trend
 
@@ -213,7 +205,6 @@ def bot_loop():
         except Exception as e:
             print(f"Erreur durant la boucle : {e}")
 
-        # Scan toutes les 5 minutes
         time.sleep(300)
 
 if __name__ == "__main__":
