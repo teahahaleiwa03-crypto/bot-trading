@@ -32,7 +32,6 @@ PAIRES = {
     "GBP/JPY": "GBPJPY=X"
 }
 
-# Variable globale stockant l'ID du message à éditer
 dashboard_msg_id = None
 
 # ==========================================
@@ -89,9 +88,19 @@ def check_session_active():
 # CALCUL DES INDICATEURS ET ANALYSE
 # ==========================================
 def get_market_data(ticker):
+    """Récupère les données avec gestion du rate limit."""
     try:
-        data_h1 = yf.download(ticker, period="10d", interval="1h", progress=False)
-        data_m15 = yf.download(ticker, period="5d", interval="15m", progress=False)
+        # Session personnalisée pour éviter le blocage Yahoo Finance
+        session = requests.Session()
+        session.headers['User-Agent'] = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'
+        
+        data_h1 = yf.download(ticker, period="10d", interval="1h", progress=False, session=session)
+        time.sleep(2)  # Pause pour ne pas surcharger l'API
+        data_m15 = yf.download(ticker, period="5d", interval="15m", progress=False, session=session)
+        
+        if data_h1.empty or data_m15.empty:
+            return None, None
+            
         return data_h1, data_m15
     except Exception as e:
         print(f"Erreur téléchargement {ticker} : {e}")
@@ -99,7 +108,7 @@ def get_market_data(ticker):
 
 def analyze_h1_trend(df_h1):
     if df_h1 is None or len(df_h1) < 50:
-        return "NEUTRE"
+        return "INDISPONIBLE"
     close = df_h1['Close']
     ema20 = close.ewm(span=20, adjust=False).mean().iloc[-1]
     ema50 = close.ewm(span=50, adjust=False).mean().iloc[-1]
@@ -112,7 +121,7 @@ def analyze_h1_trend(df_h1):
         return "NEUTRE"
 
 def check_m15_signal(df_m15, trend_h1):
-    if df_m15 is None or len(df_m15) < 200 or trend_h1 == "NEUTRE":
+    if df_m15 is None or len(df_m15) < 200 or trend_h1 in ["NEUTRE", "INDISPONIBLE"]:
         return None
     close = df_m15['Close']
     high = df_m15['High']
@@ -159,11 +168,11 @@ def bot_loop():
 
             for nom_paire, ticker in PAIRES.items():
                 df_h1, df_m15 = get_market_data(ticker)
-                time.sleep(1)
+                time.sleep(3)  # Pause renforcée
                 trend = analyze_h1_trend(df_h1)
                 trends[nom_paire] = trend
 
-                if is_active:
+                if is_active and trend != "INDISPONIBLE":
                     sig = check_m15_signal(df_m15, trend)
                     if sig:
                         signals[nom_paire] = sig
@@ -175,17 +184,22 @@ def bot_loop():
             dashboard_text += f"📈 <b>Tendances H1 Actuelles :</b>\n"
 
             for nom_paire, trend in trends.items():
-                emoji = "🟢" if trend == "HAUSSIER" else ("🔴" if trend == "BAISSIER" else "⚪")
+                if trend == "HAUSSIER":
+                    emoji = "🟢"
+                elif trend == "BAISSIER":
+                    emoji = "🔴"
+                elif trend == "INDISPONIBLE":
+                    emoji = "⚠️"
+                else:
+                    emoji = "⚪"
                 dashboard_text += f"• <b>{nom_paire} :</b> {emoji} {trend}\n"
 
             dashboard_text += f"\n<b>Filtres :</b> Trend H1 + SMA200 M15 + RSI + ATR Volatilité"
 
-            # Tentative de mise à jour du message existant
             success = False
             if dashboard_msg_id:
                 success = update_telegram_message(dashboard_msg_id, dashboard_text)
 
-            # Si le message n'existe pas ou que l'édition a échoué, on en renvoie un nouveau
             if not success:
                 dashboard_msg_id = send_telegram_message(dashboard_text)
 
@@ -199,7 +213,7 @@ def bot_loop():
         except Exception as e:
             print(f"Erreur durant la boucle : {e}")
 
-        # Pause de 5 minutes entre chaque scan
+        # Scan toutes les 5 minutes
         time.sleep(300)
 
 if __name__ == "__main__":
