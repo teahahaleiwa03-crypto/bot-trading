@@ -32,6 +32,9 @@ PAIRES = {
     "GBP/JPY": "GBPJPY=X"
 }
 
+# Variable globale stockant l'ID du message à éditer
+dashboard_msg_id = None
+
 # ==========================================
 # FONCTIONS TELEGRAM API
 # ==========================================
@@ -46,10 +49,12 @@ def send_telegram_message(text):
     }
     try:
         res = requests.post(url, json=payload, timeout=10)
-        return res.json().get("result", {}).get("message_id")
+        data = res.json()
+        if data.get("ok"):
+            return data.get("result", {}).get("message_id")
     except Exception as e:
-        print(f"Erreur Telegram : {e}")
-        return None
+        print(f"Erreur Envoi Telegram : {e}")
+    return None
 
 def update_telegram_message(message_id, text):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID or not message_id:
@@ -63,9 +68,10 @@ def update_telegram_message(message_id, text):
     }
     try:
         res = requests.post(url, json=payload, timeout=10)
-        return res.json().get("ok", False)
+        data = res.json()
+        return data.get("ok", False)
     except Exception as e:
-        print(f"Erreur Mise à jour Telegram : {e}")
+        print(f"Erreur Edit Telegram : {e}")
         return False
 
 # ==========================================
@@ -141,7 +147,7 @@ def check_m15_signal(df_m15, trend_h1):
     return None
 
 def bot_loop():
-    dashboard_msg_id = None
+    global dashboard_msg_id
     
     while True:
         try:
@@ -174,12 +180,13 @@ def bot_loop():
 
             dashboard_text += f"\n<b>Filtres :</b> Trend H1 + SMA200 M15 + RSI + ATR Volatilité"
 
-            # Tente de mettre à jour le message. Si ça échoue, crée un nouveau message
-            if dashboard_msg_id is not None:
-                updated = update_telegram_message(dashboard_msg_id, dashboard_text)
-                if not updated:
-                    dashboard_msg_id = send_telegram_message(dashboard_text)
-            else:
+            # Tentative de mise à jour du message existant
+            success = False
+            if dashboard_msg_id:
+                success = update_telegram_message(dashboard_msg_id, dashboard_text)
+
+            # Si le message n'existe pas ou que l'édition a échoué, on en renvoie un nouveau
+            if not success:
                 dashboard_msg_id = send_telegram_message(dashboard_text)
 
             for paire, signal in signals.items():
@@ -192,7 +199,7 @@ def bot_loop():
         except Exception as e:
             print(f"Erreur durant la boucle : {e}")
 
-        # Scan toutes les 5 minutes (300 secondes)
+        # Pause de 5 minutes entre chaque scan
         time.sleep(300)
 
 if __name__ == "__main__":
