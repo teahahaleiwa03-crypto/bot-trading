@@ -32,14 +32,11 @@ PAIRES = {
     "GBP/JPY": "GBPJPY=X"
 }
 
-dashboard_message_id = None
-
 # ==========================================
 # FONCTIONS TELEGRAM API
 # ==========================================
 def send_telegram_message(text):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        print("Erreur: Les tokens Telegram ne sont pas configurés.")
         return None
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {
@@ -56,7 +53,7 @@ def send_telegram_message(text):
 
 def update_telegram_message(message_id, text):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID or not message_id:
-        return
+        return False
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/editMessageText"
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
@@ -65,9 +62,11 @@ def update_telegram_message(message_id, text):
         "parse_mode": "HTML"
     }
     try:
-        requests.post(url, json=payload, timeout=10)
+        res = requests.post(url, json=payload, timeout=10)
+        return res.json().get("ok", False)
     except Exception as e:
         print(f"Erreur Mise à jour Telegram : {e}")
+        return False
 
 # ==========================================
 # GESTION DES SESSIONS (24H/24 LUN-VEN)
@@ -142,8 +141,8 @@ def check_m15_signal(df_m15, trend_h1):
     return None
 
 def bot_loop():
-    """Boucle d'exécution permanente du bot."""
-    global dashboard_message_id
+    dashboard_msg_id = None
+    
     while True:
         try:
             is_active, session_str = check_session_active()
@@ -175,10 +174,13 @@ def bot_loop():
 
             dashboard_text += f"\n<b>Filtres :</b> Trend H1 + SMA200 M15 + RSI + ATR Volatilité"
 
-            if dashboard_message_id is None:
-                dashboard_message_id = send_telegram_message(dashboard_text)
+            # Tente de mettre à jour le message. Si ça échoue, crée un nouveau message
+            if dashboard_msg_id is not None:
+                updated = update_telegram_message(dashboard_msg_id, dashboard_text)
+                if not updated:
+                    dashboard_msg_id = send_telegram_message(dashboard_text)
             else:
-                update_telegram_message(dashboard_message_id, dashboard_text)
+                dashboard_msg_id = send_telegram_message(dashboard_text)
 
             for paire, signal in signals.items():
                 alert_text = f"🚨 <b>SIGNAL DE TRADING DETECTÉ</b> 🚨\n\n"
@@ -190,11 +192,9 @@ def bot_loop():
         except Exception as e:
             print(f"Erreur durant la boucle : {e}")
 
-        # Pause de 5 minutes entre chaque scan
+        # Scan toutes les 5 minutes (300 secondes)
         time.sleep(300)
 
 if __name__ == "__main__":
-    # Lancement du serveur web Flask sur un thread secondaire
     threading.Thread(target=run_flask, daemon=True).start()
-    # Lancement de la boucle d'analyse du bot
     bot_loop()
