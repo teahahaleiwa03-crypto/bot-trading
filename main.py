@@ -1,247 +1,203 @@
 import os
 import time
-import requests
-import pandas as pd
 from datetime import datetime
-from flask import Flask
-from threading import Thread
+import pytz
+import yfinance as yf
+import requests
 
 # ==========================================
-# CONFIGURATION
+# CONFIGURATION ET VARIABLES D'ENVIRONNEMENT
 # ==========================================
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
-ACTIFS = {
+# Liste des paires surveillées
+PAIRES = {
     "EUR/USD": "EURUSD=X",
     "GBP/USD": "GBPUSD=X",
     "GBP/JPY": "GBPJPY=X"
 }
 
-dernier_signal = {actif: None for actif in ACTIFS.keys()}
-MESSAGE_PIN_ID = None
+# Variable pour conserver l'ID du message Dashboard épinglé
+dashboard_message_id = None
 
 # ==========================================
-# RÉCUPÉRATION DONNÉES SÉCURISÉE (NO RATE-LIMIT)
+# FONCTIONS TELEGRAM API
 # ==========================================
-def telecharger_donnees_yahoo(ticker, range_period, interval):
-    try:
-        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?range={range_period}&interval={interval}"
-        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
-        res = requests.get(url, headers=headers, timeout=10).json()
-        
-        result = res['chart']['result'][0]
-        timestamps = result['timestamp']
-        quote = result['indicators']['quote'][0]
-        
-        df = pd.DataFrame({
-            'Open': quote['open'],
-            'High': quote['high'],
-            'Low': quote['low'],
-            'Close': quote['close']
-        }, index=pd.to_datetime(timestamps, unit='s')).dropna()
-        
-        return df
-    except Exception as e:
-        print(f"⚠️ Erreur téléchargement {ticker} ({interval}): {e}")
-        return pd.DataFrame()
-
-# ==========================================
-# FONCTIONS TELEGRAM & DASHBOARD
-# ==========================================
-def envoyer_telegram(message):
+def send_telegram_message(text):
+    """Envoie un nouveau message sur Telegram."""
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        print("⚠️ Variables TELEGRAM manquantes dans Environment.")
-        return
+        print("Erreur: Les tokens Telegram ne sont pas configurés.")
+        return None
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"}
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": text,
+        "parse_mode": "HTML"
+    }
     try:
-        res = requests.post(url, json=payload, timeout=10).json()
-        if not res.get("ok"):
-            print(f"❌ Erreur API Telegram: {res}")
+        res = requests.post(url, json=payload, timeout=10)
+        return res.json().get("result", {}).get("message_id")
     except Exception as e:
-        print(f"❌ Erreur envoi Telegram: {e}")
+        print(f"Erreur lors de l'envoi du message Telegram : {e}")
+        return None
 
-def mettre_a_jour_dashboard(tendances, en_session):
-    global MESSAGE_PIN_ID
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+def update_telegram_message(message_id, text):
+    """Met à jour un message Telegram existant (Dashboard)."""
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID or not message_id:
         return
-
-    statut_session = "🟢 ACTIVE (Londres / NY)" if en_session else "🔴 INACTIVE (Hors Session)"
-    heure_actuelle = datetime.utcnow().strftime("%H:%M UTC")
-
-    texte = (
-        f"📊 *DASHBOARD DAY TRADING FOREX*\n"
-        f"-----------------------------------\n"
-        f"⏰ *Dernier scan :* {heure_actuelle}\n"
-        f"🎯 *Session :* {statut_session}\n\n"
-        f"📈 *Tendances H1 Actuelles :*\n"
-    )
-
-    for actif, tend in tendances.items():
-        emoji = "🟢 HAUSSIER" if tend == "HAUSSIER" else ("🔴 BAISSIER" if tend == "BAISSIER" else "⚪ NEUTRE")
-        texte += f"• *{actif} :* {emoji}\n"
-
-    texte += "\n*Filtres :* Trend H1 + SMA200 M15 + RSI + ATR Volatilité"
-
-    # Tentative d'édition
-    if MESSAGE_PIN_ID:
-        try:
-            url_edit = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/editMessageText"
-            payload = {"chat_id": TELEGRAM_CHAT_ID, "message_id": MESSAGE_PIN_ID, "text": texte, "parse_mode": "Markdown"}
-            res = requests.post(url_edit, json=payload, timeout=10).json()
-            if res.get("ok"):
-                return
-        except Exception as e:
-            print(f"⚠️ Erreur édition Dashboard: {e}")
-
-    # Création d'un nouveau message si pas de message existant
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/editMessageText"
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "message_id": message_id,
+        "text": text,
+        "parse_mode": "HTML"
+    }
     try:
-        url_send = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        payload = {"chat_id": TELEGRAM_CHAT_ID, "text": texte, "parse_mode": "Markdown"}
-        res_send = requests.post(url_send, json=payload, timeout=10).json()
-
-        if res_send.get("ok"):
-            MESSAGE_PIN_ID = res_send["result"]["message_id"]
-            url_pin = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/pinChatMessage"
-            requests.post(url_pin, json={"chat_id": TELEGRAM_CHAT_ID, "message_id": MESSAGE_PIN_ID, "disable_notification": True})
-            print("📌 Dashboard envoyé et épinglé avec succès sur Telegram !")
-        else:
-            print(f"❌ Échec envoi Dashboard Telegram: {res_send}")
+        requests.post(url, json=payload, timeout=10)
     except Exception as e:
-        print(f"❌ Erreur création Dashboard: {e}")
+        print(f"Erreur lors de la mise à jour du message Telegram : {e}")
 
 # ==========================================
-# STRATÉGIE DAY TRADING MULTI-TP
+# GESTION DES SESSIONS (24H/24 LUN-VEN)
 # ==========================================
-def est_jour_et_session_valide():
-    maintenant = datetime.utcnow()
-    if maintenant.weekday() > 4:
-        return False
-    return 7 <= maintenant.hour < 17
+def check_session_active():
+    """
+    Vérifie si le marché Forex est ouvert (Du lundi au vendredi, 24h/24)
+    """
+    now_utc = datetime.now(pytz.utc)
+    weekday = now_utc.weekday()  # 0 = Lundi, ..., 4 = Vendredi, 5 = Samedi, 6 = Dimanche
+    
+    if weekday < 5:
+        return True, "🟢 ACTIVE (24/24 - Lun/Ven)"
+    else:
+        return False, "🔴 INACTIVE (Week-end)"
 
-def obtenir_tendance_h1(ticker):
-    df = telecharger_donnees_yahoo(ticker, "5d", "1h")
-    if df.empty or len(df) < 30:
-        return "NEUTRE"
-
-    ema20 = df['Close'].ewm(span=20, adjust=False).mean().iloc[-1]
-    ema50 = df['Close'].ewm(span=50, adjust=False).mean().iloc[-1]
-    prix = df['Close'].iloc[-1]
-
-    if prix > ema20 and ema20 > ema50:
-        return "HAUSSIER"
-    elif prix < ema20 and ema20 < ema50:
-        return "BAISSIER"
-    return "NEUTRE"
-
-def analyser_signal_daytrading(df, tendance_h1):
-    if len(df) < 200:
+# ==========================================
+# CALCUL DES INDICATEURS ET ANALYSE
+# ==========================================
+def get_market_data(ticker):
+    """Récupère les données historiques H1 et M15 via yfinance."""
+    try:
+        data_h1 = yf.download(ticker, period="10d", interval="1h", progress=False)
+        data_m15 = yf.download(ticker, period="5d", interval="15m", progress=False)
+        return data_h1, data_m15
+    except Exception as e:
+        print(f"Erreur de téléchargement des données pour {ticker} : {e}")
         return None, None
 
-    df['sma200'] = df['Close'].rolling(window=200).mean()
-    delta = df['Close'].diff()
+def analyze_h1_trend(df_h1):
+    """Détermine la tendance générale H1 (EMA20 vs EMA50)."""
+    if df_h1 is None or len(df_h1) < 50:
+        return "NEUTRE"
+    
+    close = df_h1['Close']
+    ema20 = close.ewm(span=20, adjust=False).mean().iloc[-1]
+    ema50 = close.ewm(span=50, adjust=False).mean().iloc[-1]
+    current_price = close.iloc[-1]
+    
+    if current_price > ema20 and ema20 > ema50:
+        return "HAUSSIER"
+    elif current_price < ema20 and ema20 < ema50:
+        return "BAISSIER"
+    else:
+        return "NEUTRE"
+
+def check_m15_signal(df_m15, trend_h1):
+    """Exécute les filtres M15 pour valider un signal de trading."""
+    if df_m15 is None or len(df_m15) < 200 or trend_h1 == "NEUTRE":
+        return None
+
+    close = df_m15['Close']
+    high = df_m15['High']
+    low = df_m15['Low']
+
+    # 1. Moyenne Mobile SMA 200 sur M15
+    sma200 = close.rolling(window=200).mean().iloc[-1]
+    current_close = close.iloc[-1]
+
+    # 2. RSI (14)
+    delta = close.diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
     rs = gain / loss
-    df['rsi'] = 100 - (100 / (1 + rs))
+    rsi = 100 - (100 / (1 + rs))
+    current_rsi = rsi.iloc[-1]
 
-    df['tr'] = pd.concat([
-        df['High'] - df['Low'],
-        (df['High'] - df['Close'].shift(1)).abs(),
-        (df['Low'] - df['Close'].shift(1)).abs()
-    ], axis=1).max(axis=1)
-    df['atr'] = df['tr'].rolling(window=14).mean()
+    # 3. ATR (14) - Volatilité
+    tr = (high - low).combine((high - close.shift(1)).abs(), max).combine((low - close.shift(1)).abs(), max)
+    atr = tr.rolling(window=14).mean().iloc[-1]
+    current_candle_size = high.iloc[-1] - low.iloc[-1]
+    volatility_ok = current_candle_size >= (0.6 * atr)
 
-    c3 = df.iloc[-1]
-    rsi_val = c3['rsi']
-    atr_val = c3['atr']
-    sma200_val = c3['sma200']
+    # 4. Cassure du Plus Haut / Plus Bas des 10 dernières bougies
+    swing_high = high.iloc[-11:-1].max()
+    swing_low = low.iloc[-11:-1].min()
 
-    filtre_volatilite = (c3['High'] - c3['Low']) >= (0.6 * atr_val)
-    swing_high = df['High'].iloc[-11:-1].max()
-    swing_low = df['Low'].iloc[-11:-1].min()
+    # --- Verification BUY ---
+    if trend_h1 == "HAUSSIER" and current_close > sma200:
+        if 50 < current_rsi < 70 and current_close > swing_high and volatility_ok:
+            return "BUY"
 
-    rsi_buy = (rsi_val > 50) and (rsi_val < 70)
-    cond_buy = (tendance_h1 == "HAUSSIER") and (c3['Close'] > sma200_val) and rsi_buy and (c3['Close'] > swing_high) and filtre_volatilite
+    # --- Verification SELL ---
+    if trend_h1 == "BAISSIER" and current_close < sma200:
+        if 30 < current_rsi < 50 and current_close < swing_low and volatility_ok:
+            return "SELL"
 
-    rsi_sell = (rsi_val < 50) and (rsi_val > 30)
-    cond_sell = (tendance_h1 == "BAISSIER") and (c3['Close'] < sma200_val) and rsi_sell and (c3['Close'] < swing_low) and filtre_volatilite
-
-    if cond_buy:
-        pe = float(c3['Close'])
-        sl = float(min(c3['Low'], df['Low'].iloc[-2]))
-        distance_risk = pe - sl
-        if distance_risk <= 0:
-            return None, None
-        return "BUY", (pe, sl, pe + 0.5 * distance_risk, pe + 1.0 * distance_risk, pe + 1.8 * distance_risk)
-
-    elif cond_sell:
-        pe = float(c3['Close'])
-        sl = float(max(c3['High'], df['High'].iloc[-2]))
-        distance_risk = sl - pe
-        if distance_risk <= 0:
-            return None, None
-        return "SELL", (pe, sl, pe - 0.5 * distance_risk, pe - 1.0 * distance_risk, pe - 1.8 * distance_risk)
-
-    return None, None
-
-def analyser_marche():
-    global dernier_signal
-    print(f"🔍 [{datetime.utcnow().strftime('%H:%M:%S UTC')}] Début de l'analyse des marchés...")
-    session_valide = est_jour_et_session_valide()
-    tendances = {}
-
-    for nom_actif, ticker in ACTIFS.items():
-        try:
-            tendance_h1 = obtenir_tendance_h1(ticker)
-            tendances[nom_actif] = tendance_h1
-
-            if not session_valide or tendance_h1 == "NEUTRE":
-                continue
-
-            data = telecharger_donnees_yahoo(ticker, "7d", "15m")
-            if data.empty:
-                continue
-
-            signal, niveaux = analyser_signal_daytrading(data, tendance_h1)
-
-            if signal in ["BUY", "SELL"] and signal != dernier_signal[nom_actif]:
-                pe, sl, tp1, tp2, tp3 = niveaux
-                sens_txt = "ACHAT (LONG) 🟢" if signal == "BUY" else "VENTE (SHORT) 🔴"
-                dec = 3 if "JPY" in nom_actif else 5
-
-                msg = (
-                    f"🔥 *SIGNAL DAY TRADING HIGH PROBABILITY*\n\n"
-                    f"📍 *Actif :* {nom_actif}\n"
-                    f"🎯 *Sens :* {sens_txt}\n"
-                    f"📈 *Tendance H1 :* {tendance_h1}\n\n"
-                    f"💵 *PRIX D'ENTRÉE :* `{pe:.{dec}f}`\n"
-                    f"🎯 *TAKE-PROFIT 1 :* `{tp1:.{dec}f}`\n"
-                    f"🎯 *TAKE-PROFIT 2 :* `{tp2:.{dec}f}`\n"
-                    f"🎯 *TAKE-PROFIT 3 :* `{tp3:.{dec}f}`\n"
-                    f"🛡️ *STOP-LOSS :* `{sl:.{dec}f}`\n\n"
-                    f"💡 *Gestion du risque :* Dès que TP1 est atteint, déplacez le SL au prix d'entrée."
-                )
-                envoyer_telegram(msg)
-                dernier_signal[nom_actif] = signal
-
-        except Exception as e:
-            print(f"❌ Erreur sur {nom_actif}: {e}")
-
-    mettre_a_jour_dashboard(tendances, session_valide)
-    print("✅ Scan terminé avec succès.")
+    return None
 
 # ==========================================
-# SERVEUR FLASK & DÉCLENCHEMENT
+# FONCTION PRINCIPALE (DASHBOARD & SCRIP)
 # ==========================================
-app = Flask(__name__)
+def main():
+    global dashboard_message_id
+    
+    is_active, session_str = check_session_active()
+    now_utc_str = datetime.now(pytz.utc).strftime("%H:%M UTC")
 
-@app.route('/')
-def home():
-    Thread(target=analyser_marche).start()
-    return "Bot Day Trading Forex Opérationnel. Scan en cours..."
+    trends = {}
+    signals = {}
 
-if __name__ == '__main__':
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host='0.0.0.0', port=port)
+    for nom_paire, ticker in PAIRES.items():
+        df_h1, df_m15 = get_market_data(ticker)
+        
+        # Pause courte pour respecter les limites de l'API yfinance
+        time.sleep(1)
+
+        trend = analyze_h1_trend(df_h1)
+        trends[nom_paire] = trend
+
+        if is_active:
+            sig = check_m15_signal(df_m15, trend)
+            if sig:
+                signals[nom_paire] = sig
+
+    # Construction du texte du Dashboard
+    dashboard_text = f"<b>📊 DASHBOARD DAY TRADING FOREX</b>\n"
+    dashboard_text += f"-----------------------------------\n"
+    dashboard_text += f"⏰ <b>Dernier scan :</b> {now_utc_str}\n"
+    dashboard_text += f"🎯 <b>Session :</b> {session_str}\n\n"
+    dashboard_text += f"📈 <b>Tendances H1 Actuelles :</b>\n"
+
+    for nom_paire, trend in trends.items():
+        emoji = "🟢" if trend == "HAUSSIER" else ("🔴" if trend == "BAISSIER" else "⚪")
+        dashboard_text += f"• <b>{nom_paire} :</b> {emoji} {trend}\n"
+
+    dashboard_text += f"\n<b>Filtres :</b> Trend H1 + SMA200 M15 + RSI + ATR Volatilité"
+
+    # Mise à jour ou envoi du Dashboard Telegram
+    if dashboard_message_id is None:
+        dashboard_message_id = send_telegram_message(dashboard_text)
+    else:
+        update_telegram_message(dashboard_message_id, dashboard_text)
+
+    # Envoi des messages d'Alerte si des signaux sont détectés
+    for paire, signal in signals.items():
+        alert_text = f"🚨 <b>SIGNAL DE TRADING DETECTÉ</b> 🚨\n\n"
+        alert_text += f"<b>Paire :</b> {paire}\n"
+        alert_text += f"<b>Direction :</b> {'🟢 BUY' if signal == 'BUY' else '🔴 SELL'}\n"
+        alert_text += f"<b>Heure :</b> {now_utc_str}\n"
+        send_telegram_message(alert_text)
+
+if __name__ == "__main__":
+    main()
