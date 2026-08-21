@@ -68,33 +68,30 @@ def update_telegram_message(message_id, text):
 # ==========================================
 def check_session_active():
     now_utc = datetime.now(pytz.utc)
-    weekday = now_utc.weekday()
-    if weekday < 5:
+    if now_utc.weekday() < 5:
         return True, "🟢 ACTIVE (24/24 - Lun/Ven)"
     else:
         return False, "🔴 INACTIVE (Week-end)"
 
 # ==========================================
-# TELECHARGEMENT DONNEES SANS BLOCAGE
+# DONNEES & ANALYSE
 # ==========================================
 def get_market_data(ticker):
     try:
         t = yf.Ticker(ticker)
         data_h1 = t.history(period="10d", interval="1h")
-        time.sleep(1.5)
-        data_m15 = t.history(period="5d", interval="15m")
-        
+        time.sleep(1)
+        data_m15 = t.history(period="10d", interval="15m")
         if data_h1.empty or data_m15.empty:
             return None, None
-            
+        
+        data_h1 = data_h1.ffill()
+        data_m15 = data_m15.ffill()
         return data_h1, data_m15
     except Exception as e:
         print(f"Erreur téléchargement {ticker} : {e}")
         return None, None
 
-# ==========================================
-# STRATEGIE & ANALYSE
-# ==========================================
 def analyze_h1_trend(df_h1):
     if df_h1 is None or len(df_h1) < 50:
         return "INDISPONIBLE"
@@ -110,39 +107,69 @@ def analyze_h1_trend(df_h1):
         return "NEUTRE"
 
 def check_m15_signal(df_m15, trend_h1):
-    if df_m15 is None or len(df_m15) < 200 or trend_h1 in ["NEUTRE", "INDISPONIBLE"]:
+    if df_m15 is None or len(df_m15) < 50 or trend_h1 in ["NEUTRE", "INDISPONIBLE"]:
         return None
+
     close = df_m15['Close']
     high = df_m15['High']
     low = df_m15['Low']
 
-    sma200 = close.rolling(window=200).mean().iloc[-1]
-    current_close = close.iloc[-1]
+    sma200 = close.rolling(window=min(200, len(close))).mean().iloc[-1]
+    current_close = float(close.iloc[-1])
 
     delta = close.diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
     rs = gain / loss
     rsi = 100 - (100 / (1 + rs))
-    current_rsi = rsi.iloc[-1]
+    current_rsi = float(rsi.iloc[-1])
 
     tr = (high - low).combine((high - close.shift(1)).abs(), max).combine((low - close.shift(1)).abs(), max)
-    atr = tr.rolling(window=14).mean().iloc[-1]
-    current_candle_size = high.iloc[-1] - low.iloc[-1]
+    atr = float(tr.rolling(window=14).mean().iloc[-1])
+    
+    if str(atr) == "nan" or atr == 0:
+        atr = current_close * 0.0015
+
+    current_candle_size = float(high.iloc[-1] - low.iloc[-1])
     volatility_ok = current_candle_size >= (0.6 * atr)
 
-    swing_high = high.iloc[-11:-1].max()
-    swing_low = low.iloc[-11:-1].min()
+    swing_high = float(high.iloc[-11:-1].max())
+    swing_low = float(low.iloc[-11:-1].min())
 
+    direction = None
     if trend_h1 == "HAUSSIER" and current_close > sma200:
         if 50 < current_rsi < 70 and current_close > swing_high and volatility_ok:
-            return "BUY"
+            direction = "BUY"
 
     if trend_h1 == "BAISSIER" and current_close < sma200:
         if 30 < current_rsi < 50 and current_close < swing_low and volatility_ok:
-            return "SELL"
+            direction = "SELL"
 
-    return None
+    if not direction:
+        return None
+
+    sl_distance = 1.5 * atr
+    if direction == "BUY":
+        entry = current_close
+        sl = entry - sl_distance
+        tp1 = entry + (1.0 * sl_distance)
+        tp2 = entry + (1.5 * sl_distance)
+        tp3 = entry + (2.5 * sl_distance)
+    else:
+        entry = current_close
+        sl = entry + sl_distance
+        tp1 = entry - (1.0 * sl_distance)
+        tp2 = entry - (1.5 * sl_distance)
+        tp3 = entry - (2.5 * sl_distance)
+
+    return {
+        "direction": direction,
+        "entry": entry,
+        "sl": sl,
+        "tp1": tp1,
+        "tp2": tp2,
+        "tp3": tp3
+    }
 
 # ==========================================
 # BOUCLE PRINCIPALE
@@ -160,14 +187,13 @@ def bot_loop():
 
             for nom_paire, ticker in PAIRES.items():
                 df_h1, df_m15 = get_market_data(ticker)
-                time.sleep(2)
                 trend = analyze_h1_trend(df_h1)
                 trends[nom_paire] = trend
 
                 if is_active and trend != "INDISPONIBLE":
-                    sig = check_m15_signal(df_m15, trend)
-                    if sig:
-                        signals[nom_paire] = sig
+                    trade_info = check_m15_signal(df_m15, trend)
+                    if trade_info:
+                        signals[nom_paire] = trade_info
 
             dashboard_text = f"<b>📊 DASHBOARD DAY TRADING FOREX</b>\n"
             dashboard_text += f"-----------------------------------\n"
@@ -176,17 +202,10 @@ def bot_loop():
             dashboard_text += f"📈 <b>Tendances H1 Actuelles :</b>\n"
 
             for nom_paire, trend in trends.items():
-                if trend == "HAUSSIER":
-                    emoji = "🟢"
-                elif trend == "BAISSIER":
-                    emoji = "🔴"
-                elif trend == "INDISPONIBLE":
-                    emoji = "⚠️"
-                else:
-                    emoji = "⚪"
+                emoji = "🟢" if trend == "HAUSSIER" else ("🔴" if trend == "BAISSIER" else ("⚠️" if trend == "INDISPONIBLE" else "⚪"))
                 dashboard_text += f"• <b>{nom_paire} :</b> {emoji} {trend}\n"
 
-            dashboard_text += f"\n<b>Filtres :</b> Trend H1 + SMA200 M15 + RSI + ATR Volatilité"
+            dashboard_text += f"\n<b>Filtres :</b> Trend H1 + SMA200 M15 + RSI + ATR"
 
             success = False
             if dashboard_msg_id:
@@ -195,11 +214,21 @@ def bot_loop():
             if not success:
                 dashboard_msg_id = send_telegram_message(dashboard_text)
 
-            for paire, signal in signals.items():
+            # Envoi forcé des détails du signal
+            for paire, trade in signals.items():
+                digits = 3 if "JPY" in paire else 5
+                dir_symbol = "🟢 BUY" if trade['direction'] == 'BUY' else "🔴 SELL"
+                
                 alert_text = f"🚨 <b>SIGNAL DE TRADING DETECTÉ</b> 🚨\n\n"
                 alert_text += f"<b>Paire :</b> {paire}\n"
-                alert_text += f"<b>Direction :</b> {'🟢 BUY' if signal == 'BUY' else '🔴 SELL'}\n"
-                alert_text += f"<b>Heure :</b> {now_utc_str}\n"
+                alert_text += f"<b>Direction :</b> {dir_symbol}\n\n"
+                alert_text += f"📍 <b>Prix d'entrée :</b> {trade['entry']:.{digits}f}\n"
+                alert_text += f"🛑 <b>Stop Loss (SL) :</b> {trade['sl']:.{digits}f}\n"
+                alert_text += f"🎯 <b>Take Profit 1 (TP1) :</b> {trade['tp1']:.{digits}f}\n"
+                alert_text += f"🎯 <b>Take Profit 2 (TP2) :</b> {trade['tp2']:.{digits}f}\n"
+                alert_text += f"🎯 <b>Take Profit 3 (TP3) :</b> {trade['tp3']:.{digits}f}\n\n"
+                alert_text += f"⏰ <i>Heure : {now_utc_str}</i>"
+                
                 send_telegram_message(alert_text)
 
         except Exception as e:
