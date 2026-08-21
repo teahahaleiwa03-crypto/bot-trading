@@ -33,6 +33,7 @@ PAIRES = {
 }
 
 dashboard_msg_id = None
+last_known_trends = {"EUR/USD": "NEUTRE", "GBP/USD": "NEUTRE", "GBP/JPY": "NEUTRE"}
 
 # ==========================================
 # TELEGRAM API
@@ -79,9 +80,9 @@ def check_session_active():
 def get_market_data(ticker):
     try:
         t = yf.Ticker(ticker)
-        data_h1 = t.history(period="10d", interval="1h")
-        time.sleep(1)
-        data_m15 = t.history(period="10d", interval="15m")
+        data_h1 = t.history(period="5d", interval="1h")
+        time.sleep(2)  # Pause pour éviter de se faire bloquer par Yahoo
+        data_m15 = t.history(period="5d", interval="15m")
         if data_h1.empty or data_m15.empty:
             return None, None
         
@@ -92,19 +93,25 @@ def get_market_data(ticker):
         print(f"Erreur téléchargement {ticker} : {e}")
         return None, None
 
-def analyze_h1_trend(df_h1):
+def analyze_h1_trend(df_h1, pair_name):
+    global last_known_trends
     if df_h1 is None or len(df_h1) < 50:
-        return "INDISPONIBLE"
+        return last_known_trends.get(pair_name, "NEUTRE")
+    
     close = df_h1['Close']
     ema20 = close.ewm(span=20, adjust=False).mean().iloc[-1]
     ema50 = close.ewm(span=50, adjust=False).mean().iloc[-1]
     current_price = close.iloc[-1]
+    
     if current_price > ema20 and ema20 > ema50:
-        return "HAUSSIER"
+        res = "HAUSSIER"
     elif current_price < ema20 and ema20 < ema50:
-        return "BAISSIER"
+        res = "BAISSIER"
     else:
-        return "NEUTRE"
+        res = "NEUTRE"
+        
+    last_known_trends[pair_name] = res
+    return res
 
 def check_m15_signal(df_m15, trend_h1):
     if df_m15 is None or len(df_m15) < 50 or trend_h1 in ["NEUTRE", "INDISPONIBLE"]:
@@ -187,7 +194,7 @@ def bot_loop():
 
             for nom_paire, ticker in PAIRES.items():
                 df_h1, df_m15 = get_market_data(ticker)
-                trend = analyze_h1_trend(df_h1)
+                trend = analyze_h1_trend(df_h1, nom_paire)
                 trends[nom_paire] = trend
 
                 if is_active and trend != "INDISPONIBLE":
@@ -202,7 +209,7 @@ def bot_loop():
             dashboard_text += f"📈 <b>Tendances H1 Actuelles :</b>\n"
 
             for nom_paire, trend in trends.items():
-                emoji = "🟢" if trend == "HAUSSIER" else ("🔴" if trend == "BAISSIER" else ("⚠️" if trend == "INDISPONIBLE" else "⚪"))
+                emoji = "🟢" if trend == "HAUSSIER" else ("🔴" if trend == "BAISSIER" else "⚪")
                 dashboard_text += f"• <b>{nom_paire} :</b> {emoji} {trend}\n"
 
             dashboard_text += f"\n<b>Filtres :</b> Trend H1 + SMA200 M15 + RSI + ATR"
@@ -214,7 +221,7 @@ def bot_loop():
             if not success:
                 dashboard_msg_id = send_telegram_message(dashboard_text)
 
-            # Envoi forcé des détails du signal
+            # Envoi des signaux avec détails complets
             for paire, trade in signals.items():
                 digits = 3 if "JPY" in paire else 5
                 dir_symbol = "🟢 BUY" if trade['direction'] == 'BUY' else "🔴 SELL"
